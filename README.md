@@ -7,6 +7,8 @@
 覆盖没有字幕的视频与直播。
 请注意，务必输入你自己的LLM配置，可以参考使用硅基流动的 tencent/Hunyuan-MT-7B 目前限免中，不会产生成本。
 
+<img src="view.png" alt="界面预览" style="max-width: 100%; border: 1px solid #ccc; border-radius: 8px;" />
+
 
 ## 架构
 
