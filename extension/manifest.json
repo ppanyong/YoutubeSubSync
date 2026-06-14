@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "YoutubeSubSync 实时中文字幕",
+  "version": "0.1.0",
+  "description": "抓取 YouTube 字幕轨，实时翻译成中文并叠加显示。快捷键一键开关。",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "YoutubeSubSync（点击或按快捷键开关）"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["src/content-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["src/content-ui.js"],
+      "css": ["src/overlay.css"],
+      "world": "ISOLATED",
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-translate": {
+      "suggested_key": {
+        "default": "Alt+Shift+Y",
+        "mac": "Alt+Shift+Y"
+      },
+      "description": "开关中文字幕翻译"
+    }
+  }
+}

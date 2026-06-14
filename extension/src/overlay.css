@@ -1,0 +1,60 @@
+#ytt-subtitle {
+  position: absolute;
+  left: 50%;
+  bottom: 12%;
+  transform: translateX(-50%);
+  max-width: 80%;
+  width: max-content;
+  z-index: 60;
+  pointer-events: none;
+  text-align: center;
+  font-size: 26px;
+  line-height: 1.35;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 0 4px #000, 0 0 8px #000, 0 2px 6px rgba(0, 0, 0, 0.9);
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  white-space: pre-wrap;
+}
+
+#ytt-subtitle .ytt-zh {
+  display: block;
+}
+
+#ytt-subtitle .ytt-en {
+  display: block;
+  font-size: 26px;
+  font-weight: 600;
+  opacity: 0.92;
+  margin-top: 4px;
+}
+
+#ytt-toast {
+  position: fixed;
+  top: 70px;
+  right: 24px;
+  z-index: 99999;
+  background: rgba(20, 20, 20, 0.92);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  max-width: 320px;
+}
+
+#ytt-toast .ytt-toast-link {
+  display: inline-block;
+  margin-top: 8px;
+  color: #4ea1ff;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#ytt-toast .ytt-toast-link:hover {
+  text-decoration: underline;
+}
