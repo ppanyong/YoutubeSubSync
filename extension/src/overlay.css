@@ -58,3 +58,51 @@
 #ytt-toast .ytt-toast-link:hover {
   text-decoration: underline;
 }
+
+/* 持久进度面板：左上角，显示字幕加载与翻译进度 */
+#ytt-status {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 99998;
+  background: rgba(20, 20, 20, 0.88);
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  min-width: 220px;
+  pointer-events: none;
+  border-left: 3px solid #ff8c00;
+}
+
+#ytt-status.ytt-status-done {
+  border-left-color: #4caf50;
+}
+
+#ytt-status .ytt-status-text {
+  white-space: nowrap;
+}
+
+#ytt-status .ytt-status-bar {
+  margin-top: 6px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#ytt-status .ytt-status-bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #ff8c00, #ffb347);
+  border-radius: 2px;
+  transition: width 0.35s ease;
+}
+
+#ytt-status.ytt-status-done .ytt-status-bar > i {
+  background: linear-gradient(90deg, #4caf50, #81c784);
+}

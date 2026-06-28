@@ -88,12 +88,29 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
   .entry:last-child { border-bottom: none; }
   .entry .en { color: var(--muted); }
   .entry .zh { color: var(--text); margin-top: 3px; }
+  .subtitle-box {
+    margin-top: 12px; padding: 12px 14px; background: #0f172a;
+    border: 1px solid var(--line); border-radius: 9px; max-height: 360px; overflow: auto;
+    font-size: 13px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+  }
+  .subtitle-meta { color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
+  .subtitle-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; }
+  .btn-accent { background: var(--accent2); color: #0f172a; }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    font-weight: 600; margin-left: 6px;
+  }
+  .badge.ready { background: rgba(34,197,94,.15); color: #4ade80; }
+  .badge.generating { background: rgba(99,102,241,.15); color: #a5b4fc; }
+  .badge.failed { background: rgba(239,68,68,.15); color: #f87171; }
+  .badge.none { background: rgba(148,163,184,.12); color: var(--muted); }
 </style>
 </head>
 <body>
   <nav class="nav">
     <a href="#settings">翻译设置</a>
     <a href="#cache">翻译缓存</a>
+    <a href="#summaries">内容小结</a>
   </nav>
 
   <div class="wrap">
@@ -135,7 +152,7 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
 
   <div class="card" id="cache" style="margin-top: 22px;">
     <h1>翻译缓存</h1>
-    <p class="sub">字幕翻译按视频 ID 缓存在后端，反复观看复用缓存，节省 LLM 调用。</p>
+    <p class="sub">字幕按视频 ID 缓存在后端。可查看按时间顺序组装的完整字幕，并一键做上下文完整重译（比逐句翻译更连贯）。</p>
     <p class="stat" id="cacheStat">加载中…</p>
 
     <div class="row" style="margin-top: 0;">
@@ -145,6 +162,19 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
 
     <div id="cacheView"></div>
     <div class="msg" id="cacheMsg"></div>
+  </div>
+
+  <div class="card" id="summaries" style="margin-top: 22px;">
+    <h1>内容小结</h1>
+    <p class="sub">当某视频字幕全部翻译完成后，系统会基于字幕自动生成一篇有深度的内容解读文章。</p>
+    <p class="stat" id="summaryStat">加载中…</p>
+
+    <div class="row" style="margin-top: 0;">
+      <button class="btn-test" id="btnSummaryRefresh">刷新列表</button>
+    </div>
+
+    <div id="summaryView"></div>
+    <div class="msg" id="summaryMsg"></div>
   </div>
   </div>
 
@@ -274,15 +304,27 @@ async function loadCacheList() {
       item.innerHTML =
         '<a class="vid" href="https://www.youtube.com/watch?v=' + encodeURIComponent(v.videoId) +
         '" target="_blank">' + esc(v.videoId) + "</a>" +
-        '<span class="meta">' + v.count + " 条 · " + fmtBytes(v.bytes) + " · " + fmtTime(v.updated) + "</span>";
+        (v.stale ? '<span class="badge failed" title="entries 与 phrases 不一致">不一致</span>' : "") +
+        '<span class="meta">' + v.count + " 句 · " + fmtBytes(v.bytes) + " · " + fmtTime(v.updated) + "</span>";
+      const btnSub = document.createElement("button");
+      btnSub.className = "mini";
+      btnSub.textContent = "完整字幕";
+      btnSub.onclick = () => viewSubtitle(v.videoId);
+      const btnRetrans = document.createElement("button");
+      btnRetrans.className = "mini btn-accent";
+      btnRetrans.style.cssText = "background:rgba(34,197,94,.2);color:#4ade80;border-color:rgba(34,197,94,.4)";
+      btnRetrans.textContent = "完整重译";
+      btnRetrans.onclick = () => retranslateVideo(v.videoId, false);
       const btnView = document.createElement("button");
       btnView.className = "mini";
-      btnView.textContent = "查看";
+      btnView.textContent = "条目";
       btnView.onclick = () => viewEntries(v.videoId);
       const btnDel = document.createElement("button");
       btnDel.className = "mini danger";
       btnDel.textContent = "删除";
       btnDel.onclick = () => deleteVideo(v.videoId);
+      item.appendChild(btnSub);
+      item.appendChild(btnRetrans);
       item.appendChild(btnView);
       item.appendChild(btnDel);
       list.appendChild(item);
@@ -293,30 +335,132 @@ async function loadCacheList() {
   }
 }
 
+function removeEntriesBox() {
+  const old = document.getElementById("entriesBox");
+  if (old) old.remove();
+}
+
+async function viewSubtitle(videoId) {
+  removeEntriesBox();
+  showCacheMsg("info", "正在加载完整字幕…");
+  try {
+    const r = await fetch("/cache/" + encodeURIComponent(videoId) + "/subtitle?format=text");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+    const box = document.createElement("div");
+    box.id = "entriesBox";
+    const st = d.stats || {};
+    box.innerHTML =
+      '<div class="subtitle-meta">视频 ' + esc(videoId) +
+      " · 共 " + (st.total || 0) + " 句 · 已译 " + (st.translated || 0) +
+      " · 来源 " + esc(d.source || "") + "</div>" +
+      '<div class="subtitle-box">' + esc(d.body || "") + "</div>" +
+      '<div class="subtitle-actions">' +
+      '<button class="mini" id="btnDlSrt">下载 SRT</button>' +
+      '<button class="mini" id="btnForceRetrans">强制全部重译</button>' +
+      "</div>";
+    cacheView.appendChild(box);
+    $("btnDlSrt").onclick = () => downloadSubtitle(videoId, "srt");
+    $("btnForceRetrans").onclick = () => retranslateVideo(videoId, true);
+    showCacheMsg("ok", "已加载完整字幕（" + (st.translated || 0) + "/" + (st.total || 0) + " 句已译）");
+  } catch (e) {
+    showCacheMsg("err", "加载字幕失败：" + e);
+  }
+}
+
+async function downloadSubtitle(videoId, format) {
+  try {
+    const r = await fetch("/cache/" + encodeURIComponent(videoId) + "/subtitle?format=" + format);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+    const blob = new Blob([d.body || ""], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = videoId + ".srt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    showCacheMsg("ok", "已下载 " + videoId + ".srt");
+  } catch (e) {
+    showCacheMsg("err", "下载失败：" + e);
+  }
+}
+
+async function retranslateVideo(videoId, force) {
+  const label = force ? "强制全部重译" : "完整重译";
+  if (!confirm("确定对视频 " + videoId + " 执行「" + label + "」？\n将使用上下文块翻译，可能需要数分钟。")) return;
+  showCacheMsg("info", label + "已启动，后台处理中…");
+  try {
+    const r = await fetch("/cache/" + encodeURIComponent(videoId) + "/retranslate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: !!force, mode: "line" }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || d.message || "HTTP " + r.status);
+    await pollRetranslate(videoId, label);
+  } catch (e) {
+    showCacheMsg("err", label + "失败：" + e);
+  }
+}
+
+async function pollRetranslate(videoId, label) {
+  for (let i = 0; i < 600; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const r = await fetch("/cache/" + encodeURIComponent(videoId) + "/retranslate/status");
+    const d = await r.json();
+    if (d.status === "running") {
+      const prog = d.total ? " " + (d.translated || 0) + "/" + d.total : "";
+      showCacheMsg("info", label + "进行中…" + prog);
+      continue;
+    }
+    if (d.status === "done") {
+      showCacheMsg("ok", label + "完成：新译 " + (d.translated || 0) + " 句，" +
+        (d.stats ? d.stats.translated + "/" + d.stats.total + " 句已就绪" : d.message || ""));
+      await viewSubtitle(videoId);
+      await loadCacheList();
+      return;
+    }
+    if (d.status === "failed") {
+      showCacheMsg("err", label + "失败：" + (d.error || "未知错误"));
+      return;
+    }
+    if (d.status === "idle") break;
+  }
+  showCacheMsg("info", label + "仍在后台运行，请稍后点「完整字幕」查看结果。");
+}
+
 async function viewEntries(videoId) {
   try {
     const r = await fetch("/cache/" + encodeURIComponent(videoId));
     const d = await r.json();
     const box = document.createElement("div");
     box.className = "entries";
-    const entries = d.entries || {};
-    const keys = Object.keys(entries);
-    if (!keys.length) {
+    const phrases = d.phrases || [];
+    const st = d.stats || {};
+    if (!phrases.length) {
       box.innerHTML = '<div class="entry empty">该视频暂无缓存条目。</div>';
     } else {
-      for (const en of keys) {
+      for (const p of phrases) {
         const row = document.createElement("div");
         row.className = "entry";
-        row.innerHTML = '<div class="en">' + esc(en) + '</div><div class="zh">' + esc(entries[en]) + "</div>";
+        const en = p.text || "";
+        const zh = p.zh || "";
+        row.innerHTML =
+          '<div class="en">' + esc(en) + "</div>" +
+          '<div class="zh">' + (zh ? esc(zh) : '<span style="color:var(--muted)">（未译）</span>') + "</div>";
         box.appendChild(row);
       }
     }
-    // 把条目展示在列表下方（替换上一次的展开）。
-    const old = document.getElementById("entriesBox");
-    if (old) old.remove();
+    removeEntriesBox();
     box.id = "entriesBox";
     cacheView.appendChild(box);
-    showCacheMsg("info", "正在查看 " + videoId + " 的 " + keys.length + " 条缓存");
+    const removed = (d.entryCount || 0) - (d.count || 0);
+    const staleNote = removed > 0 ? "，已忽略 " + removed + " 条过期缓存" : "";
+    showCacheMsg(
+      "info",
+      "按时间顺序 " + (st.total || phrases.length) + " 句 · 已译 " +
+        (st.translated || 0) + staleNote
+    );
   } catch (e) {
     showCacheMsg("err", "查看失败：" + e);
   }
@@ -348,6 +492,163 @@ $("btnClearAll").onclick = async () => {
 };
 
 loadCacheList();
+
+// ---------- 内容小结 ----------
+
+const summaryStat = $("summaryStat");
+const summaryView = $("summaryView");
+const summaryMsg = $("summaryMsg");
+
+function showSummaryMsg(type, text) {
+  summaryMsg.className = "msg " + type;
+  summaryMsg.textContent = text;
+}
+
+function summaryBadge(status) {
+  const map = {
+    ready: '<span class="badge ready">已完成</span>',
+    generating: '<span class="badge generating">生成中</span>',
+    failed: '<span class="badge failed">失败</span>',
+  };
+  return map[status] || '<span class="badge none">未生成</span>';
+}
+
+async function loadSummaryList() {
+  summaryView.innerHTML = "";
+  summaryMsg.className = "msg";
+  try {
+    const [sumR, cacheR] = await Promise.all([
+      fetch("/summaries"),
+      fetch("/cache"),
+    ]);
+    const sumD = await sumR.json();
+    const cacheD = await cacheR.json();
+    const summaries = sumD.summaries || [];
+    const videos = cacheD.videos || [];
+    const sumMap = {};
+    for (const s of summaries) sumMap[s.videoId] = s;
+
+    const ready = summaries.filter((s) => s.status === "ready").length;
+    summaryStat.innerHTML =
+      "共 <b>" + summaries.length + "</b> 条记录，已完成 <b>" + ready + "</b> 篇";
+
+    if (!videos.length) {
+      summaryView.innerHTML =
+        '<div class="empty">暂无缓存视频。请先在 YouTube 用扩展看完并翻译字幕，完成后会自动生成小结。</div>';
+      return;
+    }
+
+    const list = document.createElement("div");
+    list.className = "vlist";
+    for (const v of videos) {
+      const s = sumMap[v.videoId];
+      const item = document.createElement("div");
+      item.className = "vitem";
+      const title = s && s.title ? esc(s.title) : esc(v.videoId);
+      item.innerHTML =
+        '<a class="vid" href="https://www.youtube.com/watch?v=' + encodeURIComponent(v.videoId) +
+        '" target="_blank">' + esc(v.videoId) + "</a>" +
+        '<span class="meta">' + v.count + " 条字幕" + summaryBadge(s && s.status) + "</span>";
+
+      if (s && s.status === "ready") {
+        const btnRead = document.createElement("button");
+        btnRead.className = "mini";
+        btnRead.textContent = "阅读小结";
+        btnRead.onclick = () => window.open("/summary/" + encodeURIComponent(v.videoId) + "/article", "_blank");
+        item.appendChild(btnRead);
+      } else if (s && s.status === "generating") {
+        const btnWait = document.createElement("button");
+        btnWait.className = "mini";
+        btnWait.textContent = "生成中…";
+        btnWait.disabled = true;
+        item.appendChild(btnWait);
+      } else {
+        const btnGen = document.createElement("button");
+        btnGen.className = "mini";
+        btnGen.textContent = s && s.status === "failed" ? "重新生成" : "生成小结";
+        btnGen.onclick = () => generateSummary(v.videoId, true);
+        item.appendChild(btnGen);
+      }
+
+      if (s) {
+        const btnDel = document.createElement("button");
+        btnDel.className = "mini danger";
+        btnDel.textContent = "删除";
+        btnDel.onclick = () => deleteSummary(v.videoId);
+        item.appendChild(btnDel);
+      }
+
+      list.appendChild(item);
+      // 副标题行
+      if (s && s.title) {
+        const sub = document.createElement("div");
+        sub.className = "hint";
+        sub.style.margin = "0 0 4px 4px";
+        sub.textContent = s.title;
+        list.appendChild(sub);
+      }
+    }
+    summaryView.appendChild(list);
+  } catch (e) {
+    showSummaryMsg("err", "读取小结列表失败：" + e);
+  }
+}
+
+async function generateSummary(videoId, force) {
+  showSummaryMsg("info", "正在提交生成任务…");
+  try {
+    const r = await fetch("/summary/" + encodeURIComponent(videoId) + "/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: !!force }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+    showSummaryMsg("ok", "已提交，正在后台生成（约 1-3 分钟）。请稍后刷新列表。");
+    await loadSummaryList();
+    // 生成中时自动轮询
+    if (d.status === "generating") pollSummary(videoId);
+  } catch (e) {
+    showSummaryMsg("err", "生成失败：" + e);
+  }
+}
+
+async function pollSummary(videoId) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    try {
+      const r = await fetch("/summary/" + encodeURIComponent(videoId));
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d.status === "ready") {
+        showSummaryMsg("ok", "小结已生成：" + (d.title || videoId));
+        await loadSummaryList();
+        return;
+      }
+      if (d.status === "failed") {
+        showSummaryMsg("err", "生成失败：" + (d.error || "未知错误"));
+        await loadSummaryList();
+        return;
+      }
+    } catch (e) { /* ignore */ }
+  }
+  showSummaryMsg("info", "仍在生成中，请稍后手动刷新。");
+}
+
+async function deleteSummary(videoId) {
+  if (!confirm("确定删除视频 " + videoId + " 的内容小结？")) return;
+  try {
+    const r = await fetch("/summary/" + encodeURIComponent(videoId), { method: "DELETE" });
+    const d = await r.json();
+    showSummaryMsg(d.ok ? "ok" : "err", d.ok ? "已删除小结" : "删除失败");
+    await loadSummaryList();
+  } catch (e) {
+    showSummaryMsg("err", "删除失败：" + e);
+  }
+}
+
+$("btnSummaryRefresh").onclick = loadSummaryList;
+loadSummaryList();
 </script>
 </body>
 </html>

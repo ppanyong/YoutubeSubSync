@@ -147,11 +147,78 @@ function buildPhrases(segments) {
   return phrases;
 }
 
-function isValidTranslation(text, sourceText) {
-  if (!text) return false;
-  const src = (sourceText || "").trim();
-  const tr = text.trim();
-  return Boolean(tr) && tr.toLowerCase() !== src.toLowerCase();
+const _validationCache = new Map();
+
+function validationKey(src, dst, peers) {
+  return `${src || ""}\0${dst || ""}\0${(peers || []).join("\x01")}`;
+}
+
+function clauseCount(text) {
+  const t = (text || "").trim();
+  if (!t) return 0;
+  const m = t.match(/[.!?。！？…]+/g);
+  return Math.max(m ? m.length : 1, 1);
+}
+
+/** 轻量本地启发式（长度/句数），后端不可达时的降级。 */
+function translationPlausible(src, dst) {
+  const s = (src || "").trim();
+  const t = (dst || "").trim();
+  if (!s || !t || s.toLowerCase() === t.toLowerCase()) return false;
+  const sl = s.length;
+  const dl = t.length;
+  const maxRatio = sl < 45 ? 2.0 : 2.2;
+  if (dl > sl * maxRatio + 16) return false;
+  if (sl > 40 && dl < sl * 0.12) return false;
+  const srcC = clauseCount(s);
+  const dstC = clauseCount(t);
+  if (dstC > srcC) return false;
+  if (sl < 25 && dl > sl * 2.0 + 12 && dstC >= 2) return false;
+  return true;
+}
+
+async function validateTranslationsBatch(pairs) {
+  if (!pairs?.length) return [];
+  try {
+    const resp = await fetch(`${BACKEND_URL}/translate/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pairs }),
+    });
+    if (!resp.ok) {
+      console.warn(LOG, "校验 HTTP", resp.status);
+      return pairs.map((p) => translationPlausible(p.src, p.dst));
+    }
+    const data = await resp.json();
+    const results = data.results || [];
+    pairs.forEach((p, i) => {
+      _validationCache.set(validationKey(p.src, p.dst, p.peers), !!results[i]);
+    });
+    return results;
+  } catch (e) {
+    console.warn(LOG, "校验请求失败:", e.message);
+    return pairs.map((p) => translationPlausible(p.src, p.dst));
+  }
+}
+
+function translationValid(src, dst, peerSrcs) {
+  const k = validationKey(src, dst, peerSrcs);
+  if (_validationCache.has(k)) return _validationCache.get(k);
+  return translationPlausible(src, dst);
+}
+
+function isValidTranslation(text, sourceText, peerSrcs) {
+  return translationValid(sourceText, text, peerSrcs);
+}
+
+function peerTextsForIndex(idx) {
+  const peers = [];
+  const lo = Math.max(0, idx - 8);
+  const hi = Math.min(state.phrases.length, idx + 9);
+  for (let i = lo; i < hi; i++) {
+    if (i !== idx && state.phrases[i]?.text) peers.push(state.phrases[i].text);
+  }
+  return peers;
 }
 
 function phraseDisplayEnd(phrases, idx) {
@@ -161,11 +228,103 @@ function phraseDisplayEnd(phrases, idx) {
 }
 
 // ---------- 翻译缓存（按视频持久化，反复观看越来越全）----------
+// 真相源：state.phrases（有序句子）。state.cache 仅保存当前句子表内的 {英文: 译文}。
 
 const CACHE_PREFIX = "ytt:cache:";
 
 function cacheKey(videoId) {
   return CACHE_PREFIX + videoId;
+}
+
+/** 字幕轨指纹（与后端 translation_cache.caption_fingerprint 一致） */
+async function captionFingerprint(segments) {
+  if (!segments?.length) return "";
+  const parts = [String(segments.length)];
+  for (const s of segments.slice(0, 20)) {
+    parts.push(`${Number(s.start || 0).toFixed(3)}:${(s.text || "").trim()}`);
+  }
+  parts.push((segments[segments.length - 1].text || "").trim());
+  const sig = parts.join("\n");
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sig));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
+function phraseTextsSet() {
+  return new Set(state.phrases.map((p) => p.text));
+}
+
+/** 丢弃不在当前句子表中的缓存键，防止过期 entries 累积。 */
+function pruneCacheToPhrases() {
+  if (!state.phrases.length) return 0;
+  const texts = phraseTextsSet();
+  let removed = 0;
+  for (const k of Object.keys(state.cache)) {
+    if (!texts.has(k)) {
+      delete state.cache[k];
+      removed++;
+    }
+  }
+  if (removed) console.log(LOG, `清理 ${removed} 条过期本地缓存（不在当前句子表）`);
+  return removed;
+}
+
+/** 清除错位/无效译文（校验逻辑在后端）。 */
+async function pruneInvalidTranslations() {
+  let removed = 0;
+  const pairs = [];
+  const refs = [];
+  for (let i = 0; i < state.phrases.length; i++) {
+    const p = state.phrases[i];
+    if (p.zh) {
+      pairs.push({ src: p.text, dst: p.zh, peers: peerTextsForIndex(i) });
+      refs.push({ kind: "phrase", i });
+    }
+  }
+  for (const k of Object.keys(state.cache)) {
+    const idx = state.phrases.findIndex((p) => p.text === k);
+    pairs.push({
+      src: k,
+      dst: state.cache[k],
+      peers: idx >= 0 ? peerTextsForIndex(idx) : [],
+    });
+    refs.push({ kind: "cache", k });
+  }
+  const results = await validateTranslationsBatch(pairs);
+  results.forEach((ok, j) => {
+    if (ok) return;
+    const ref = refs[j];
+    if (ref.kind === "phrase") {
+      state.phrases[ref.i].zh = "";
+      removed++;
+    } else {
+      delete state.cache[ref.k];
+      removed++;
+    }
+  });
+  if (removed) console.log(LOG, `清理 ${removed} 条错位/无效译文`);
+  return removed;
+}
+
+/** 丢弃长度明显不合理的译文（错位 LLM 输出或脏缓存）。 */
+function sanitizeLoadedTranslations() {
+  let n = 0;
+  for (const p of state.phrases) {
+    if (p.zh && !translationPlausible(p.text, p.zh)) {
+      p.zh = "";
+      n++;
+    }
+  }
+  for (const k of Object.keys(state.cache)) {
+    if (!translationPlausible(k, state.cache[k])) {
+      delete state.cache[k];
+      n++;
+    }
+  }
+  if (n) console.log(LOG, `丢弃 ${n} 条不合理译文，将重新翻译`);
+  return n;
 }
 
 // 以合并后的英文句子为键，避免分段变化导致错配（同一视频字幕稳定）。
@@ -185,9 +344,14 @@ let _cacheSaveTimer = null;
 function saveCacheDebounced(videoId, map) {
   const vid = videoId || getActiveVideoId();
   if (!vid || !chrome?.storage?.local) return;
+  const texts = phraseTextsSet();
+  const pruned = {};
+  for (const [k, v] of Object.entries(map)) {
+    if (!texts.size || texts.has(k)) pruned[k] = v;
+  }
   clearTimeout(_cacheSaveTimer);
   _cacheSaveTimer = setTimeout(() => {
-    chrome.storage.local.set({ [cacheKey(vid)]: map }).catch((e) => {
+    chrome.storage.local.set({ [cacheKey(vid)]: pruned }).catch((e) => {
       console.warn(LOG, "写入本地缓存失败:", e);
     });
   }, 800);
@@ -197,21 +361,40 @@ let _backendSyncTimer = null;
 let _pendingBackendEntries = {};
 
 function queueBackendCache(entries) {
-  Object.assign(_pendingBackendEntries, entries);
+  const texts = phraseTextsSet();
+  const filtered = {};
+  for (const [k, v] of Object.entries(entries)) {
+    if (texts.has(k)) filtered[k] = v;
+  }
+  Object.assign(_pendingBackendEntries, filtered);
   clearTimeout(_backendSyncTimer);
   _backendSyncTimer = setTimeout(syncBackendCache, 600);
+}
+
+function currentPhrasesPayload() {
+  return state.phrases.map((p) => ({
+    start: p.start,
+    end: p.end,
+    text: p.text,
+    zh: p.zh || "",
+  }));
 }
 
 async function syncBackendCache() {
   const vid = getActiveVideoId();
   const entries = _pendingBackendEntries;
   _pendingBackendEntries = {};
-  if (!vid || !Object.keys(entries).length) return 0;
+  if (!vid || (!Object.keys(entries).length && !state.phrases.length)) return 0;
+  const fp = await captionFingerprint(state.segments);
   try {
     const r = await fetch(`${BACKEND_URL}/cache/${encodeURIComponent(vid)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries }),
+      body: JSON.stringify({
+        entries,
+        phrases: state.phrases.length ? currentPhrasesPayload() : undefined,
+        caption_fingerprint: fp || undefined,
+      }),
     });
     if (r.ok) {
       const d = await r.json();
@@ -225,13 +408,37 @@ async function syncBackendCache() {
 }
 
 // 把本地已有、但后端还没有的译文批量推上去（全缓存命中时也会执行）。
+async function syncPhrasesToBackend() {
+  const vid = getActiveVideoId();
+  if (!vid || !state.phrases.length) return;
+  const fp = await captionFingerprint(state.segments);
+  try {
+    const r = await fetch(`${BACKEND_URL}/cache/${encodeURIComponent(vid)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        entries: {},
+        phrases: currentPhrasesPayload(),
+        caption_fingerprint: fp || undefined,
+      }),
+    });
+    if (r.ok) console.log(LOG, `有序字幕已同步 ${state.phrases.length} 句`);
+  } catch (e) {
+    console.warn(LOG, "同步有序字幕失败:", e);
+  }
+}
+
 async function pushCacheDeltaToBackend(knownBackend = {}) {
   const vid = getActiveVideoId();
   if (!vid) return 0;
 
+  const phraseTexts = new Set(state.phrases.map((p) => p.text));
   const delta = {};
   for (const [en, zh] of Object.entries(state.cache)) {
-    if (!knownBackend[en] && isValidTranslation(zh, en)) {
+    if (!phraseTexts.has(en)) continue;
+    const idx = state.phrases.findIndex((p) => p.text === en);
+    const peers = idx >= 0 ? peerTextsForIndex(idx) : [];
+    if (!knownBackend[en] && translationValid(en, zh, peers)) {
       delta[en] = zh;
     }
   }
@@ -276,16 +483,58 @@ async function loadBackendCache(videoId) {
   }
 }
 
+// 翻译全部完成后，触发后端生成深度内容小结（后台异步，不阻塞播放）。
+async function triggerSummaryGeneration() {
+  const vid = getActiveVideoId();
+  const total = state.phrases.length;
+  const translated = countTranslated();
+  if (!vid || total === 0 || translated < total) return;
+
+  const phrases = state.phrases.map((p) => ({
+    text: p.text,
+    zh: p.zh || "",
+  }));
+  try {
+    const r = await fetch(`${BACKEND_URL}/summary/${encodeURIComponent(vid)}/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        phrases,
+        total_phrases: total,
+        translated_phrases: translated,
+      }),
+    });
+    const d = await r.json();
+    if (r.ok && d.status === "generating") {
+      console.log(LOG, "已触发内容小结生成");
+      toast("字幕已全部译完，正在后台生成内容小结…", 4000);
+    }
+  } catch (e) {
+    console.warn(LOG, "触发内容小结失败:", e);
+  }
+}
+
 // ---------- 后端翻译 ----------
 
-const CHUNK_SIZE = 12; // 每块句子数（整句比碎片长，块宜小）
-const CONCURRENCY = 2; // 降低并发，减轻限流
-const RETRY_ROUNDS = 4; // 补偿重试轮数
-const RETRY_CHUNK = 6; // 重试时用更小的块，提高成功率
+const CHUNK_SIZE = 4; // 后端逐条翻译，每块 4 句（4 次 LLM，带滚动上下文）
+const CONCURRENCY = 3;
+const RETRY_ROUNDS = 4;
+const RETRY_CHUNK = 2;
 
-async function translateChunk(texts) {
+async function translateChunk(texts, firstPhraseIndex) {
+  const contextBefore = [];
+  const contextZhBefore = [];
+  if (firstPhraseIndex != null && firstPhraseIndex > 0) {
+    for (let i = Math.max(0, firstPhraseIndex - 3); i < firstPhraseIndex; i++) {
+      contextBefore.push(state.phrases[i].text);
+      const z = state.phrases[i].zh;
+      contextZhBefore.push(
+        z && translationValid(state.phrases[i].text, z, peerTextsForIndex(i)) ? z : ""
+      );
+    }
+  }
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 90000);
+  const timer = setTimeout(() => ctrl.abort(), 120000);
   let resp;
   try {
     resp = await fetch(`${BACKEND_URL}/translate`, {
@@ -293,7 +542,9 @@ async function translateChunk(texts) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         segments: texts,
-        mode: "sentence",
+        mode: "line",
+        context_before: contextBefore.length ? contextBefore : undefined,
+        context_zh_before: contextZhBefore.some(Boolean) ? contextZhBefore : undefined,
         video_id: getActiveVideoId() || null,
       }),
       signal: ctrl.signal,
@@ -323,13 +574,16 @@ async function translateChunk(texts) {
   return data.translations;
 }
 
-// 接受一条译文并写入：校验译文有效、长度合理，更新缓存。
-function acceptTranslation(phrase, translated) {
+// 接受一条译文并写入（调用方应已通过后端校验）。
+function acceptTranslation(phrase, translated, phraseIndex) {
   if (!phrase || !translated) return false;
-  const tooLong = translated.length > phrase.text.length * 1.6 + 24;
-  if (!isValidTranslation(translated, phrase.text) || tooLong) return false;
-  phrase.zh = translated;
-  state.cache[phrase.text] = translated;
+  const en = phrase.text.trim();
+  const zh = translated.trim();
+  if (zh === en || !translationPlausible(en, zh)) return false;
+  phrase.zh = zh;
+  state.cache[phrase.text] = zh;
+  const peers = peerTextsForIndex(phraseIndex ?? state.phrases.indexOf(phrase));
+  _validationCache.set(validationKey(en, zh, peers), true);
   return true;
 }
 
@@ -355,18 +609,38 @@ async function translateIndices(token, indices, chunkSize) {
       const group = indices.slice(begin, begin + chunkSize);
       const slice = group.map((gi) => phrases[gi]);
       try {
-        const zhList = await translateChunk(slice.map((p) => p.text));
+        const firstIdx = group[0];
+        const zhList = await translateChunk(
+          slice.map((p) => p.text),
+          firstIdx
+        );
         if (token !== state.translateToken) return;
+        const validatePairs = slice.map((p, i) => ({
+          src: p.text,
+          dst: zhList[i] || "",
+          peers: peerTextsForIndex(group[i]),
+        }));
+        const valids = await validateTranslationsBatch(validatePairs);
         const newPairs = {};
         for (let i = 0; i < slice.length; i++) {
-          if (acceptTranslation(slice[i], zhList[i])) {
+          const gi = group[i];
+          if (valids[i] && acceptTranslation(slice[i], zhList[i], gi)) {
             newPairs[slice[i].text] = slice[i].zh;
+          } else if (slice[i].zh) {
+            slice[i].zh = "";
+            delete state.cache[slice[i].text];
+            _validationCache.set(
+              validationKey(slice[i].text, zhList[i] || "", peerTextsForIndex(gi)),
+              false
+            );
           }
         }
         saveCacheDebounced(getActiveVideoId(), state.cache);
         if (Object.keys(newPairs).length) queueBackendCache(newPairs);
+        syncPhrasesToBackend();
         state.renderKey = "";
         syncTick();
+        renderStatus();
         const zhCount = phrases.length - untranslatedIndices().length;
         toast(`翻译进度 ${zhCount}/${phrases.length} 句`, 1000);
       } catch (e) {
@@ -387,14 +661,26 @@ async function translateInBackground(token) {
   const phrases = state.phrases;
   const total = phrases.length;
 
-  // 1) 缓存命中：直接填充已有译文。
+  // 1) 缓存命中：批量校验后填充已有译文。
   let cached = 0;
-  for (const p of phrases) {
+  const cachePairs = [];
+  const cacheIndices = [];
+  for (let i = 0; i < phrases.length; i++) {
+    const p = phrases[i];
     const hit = state.cache[p.text];
-    if (hit && isValidTranslation(hit, p.text)) {
-      p.zh = hit;
-      cached++;
+    if (hit) {
+      cachePairs.push({ src: p.text, dst: hit, peers: peerTextsForIndex(i) });
+      cacheIndices.push(i);
     }
+  }
+  if (cachePairs.length) {
+    const cacheValid = await validateTranslationsBatch(cachePairs);
+    cacheValid.forEach((ok, j) => {
+      if (ok) {
+        phrases[cacheIndices[j]].zh = cachePairs[j].dst;
+        cached++;
+      }
+    });
   }
   if (cached) {
     console.log(LOG, `缓存命中 ${cached}/${total} 句`);
@@ -402,14 +688,18 @@ async function translateInBackground(token) {
     syncTick();
     toast(`缓存命中 ${cached}/${total} 句`, 1500);
   }
+  renderStatus();
 
   // 2) 首轮：从当前播放位置优先，翻译所有缺失项。
   let missing = untranslatedIndices();
   if (missing.length === 0) {
     // 全命中本地缓存时也要把译文推到后端，否则后台永远看不到记录。
     const synced = await pushCacheDeltaToBackend(state.backendCacheSnapshot);
+    await syncPhrasesToBackend();
     if (synced) toast(`已同步 ${synced} 条到后端缓存`, 2500);
     toast(`中文字幕就绪 ${total}/${total} 句 ✓`);
+    renderStatus();
+    triggerSummaryGeneration();
     return;
   }
   // 重排顺序：把当前位置之后的排前面，优先翻译正在看的部分。
@@ -438,6 +728,7 @@ async function translateInBackground(token) {
   if (token !== state.translateToken) return;
   saveCacheDebounced(state.videoId, state.cache);
   await pushCacheDeltaToBackend(state.backendCacheSnapshot);
+  await syncPhrasesToBackend();
 
   const remaining = untranslatedIndices().length;
   const zhCount = total - remaining;
@@ -453,9 +744,11 @@ async function translateInBackground(token) {
   } else {
     console.log(LOG, `翻译完成 ${total}/${total} 句`);
     toast(`中文字幕就绪 ${total}/${total} 句 ✓`);
+    triggerSummaryGeneration();
   }
   state.renderKey = "";
   syncTick();
+  renderStatus();
 }
 
 // ---------- 字幕叠加 ----------
@@ -528,7 +821,8 @@ function syncTick() {
   }
 
   // 整句显示：有译文则主显译文+小字英文；未译完则整句英文，避免碎片混杂。
-  const hasTranslation = phrase.zh && isValidTranslation(phrase.zh, phrase.text);
+  const hasTranslation =
+    phrase.zh && translationValid(phrase.text, phrase.zh, peerTextsForIndex(idx));
   const main = hasTranslation ? phrase.zh : phrase.text;
   const sub = hasTranslation ? phrase.text : "";
   const key = idx + "|" + main + "|" + sub;
@@ -558,6 +852,50 @@ function toast(msg, ms = 3000) {
   el._t = setTimeout(() => (el.style.display = "none"), ms);
 }
 
+// 持久进度面板：显示已加载字幕条数与翻译进度（开启期间常驻）。
+function ensureStatusEl() {
+  let el = document.getElementById("ytt-status");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "ytt-status";
+    el.innerHTML =
+      '<div class="ytt-status-text"></div>' +
+      '<div class="ytt-status-bar"><i></i></div>';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function countTranslated() {
+  return state.phrases.filter((p, i) => {
+    return p.zh && translationValid(p.text, p.zh, peerTextsForIndex(i));
+  }).length;
+}
+
+function renderStatus() {
+  if (!state.active) {
+    hideStatus();
+    return;
+  }
+  const el = ensureStatusEl();
+  const frag = state.segments.length;
+  const total = state.phrases.length;
+  const translated = countTranslated();
+  const pct = total ? Math.round((translated / total) * 100) : 0;
+  const done = total > 0 && translated >= total;
+  el.querySelector(".ytt-status-text").textContent = done
+    ? `字幕 ${frag} 条 · 已翻译 ${translated}/${total} 句 ✓`
+    : `字幕 ${frag} 条 · 已翻译 ${translated}/${total} 句（${pct}%）`;
+  el.querySelector(".ytt-status-bar > i").style.width = pct + "%";
+  el.classList.toggle("ytt-status-done", done);
+  el.style.display = "block";
+}
+
+function hideStatus() {
+  const el = document.getElementById("ytt-status");
+  if (el) el.style.display = "none";
+}
+
 // 友好提示：未配置 LLM 时给出说明 + 一个可点击打开设置页的链接。
 function toastWithSettingsLink(msg, ms = 12000) {
   const el = ensureToastEl();
@@ -580,6 +918,18 @@ function toastWithSettingsLink(msg, ms = 12000) {
 // ---------- 开关 ----------
 
 const LOG = "[YTT]";
+
+// 用户是否手动关闭了当前视频（关闭后本视频内不再自动开启）。
+let userOff = false;
+
+// 上报开关状态给后台，用于切换工具栏图标颜色（橙=开，黑=关）。
+function notifyState(active) {
+  try {
+    chrome.runtime.sendMessage({ type: "YTT_STATE", active: !!active });
+  } catch (e) {
+    /* service worker 未就绪时忽略 */
+  }
+}
 
 // 启动前检查后端与翻译配置是否就绪。
 // 返回 { ok, reason }：reason ∈ "offline" | "backend_error" | "no_llm"。
@@ -610,6 +960,7 @@ async function start() {
   const ready = await checkBackendReady();
   if (!ready.ok) {
     state.active = false;
+    notifyState(false);
     if (ready.reason === "no_llm") {
       console.warn(LOG, "翻译模型未配置，提示用户前往设置页。");
       toastWithSettingsLink(
@@ -623,6 +974,7 @@ async function start() {
     return;
   }
 
+  notifyState(true);
   console.log(LOG, "start(): 开始抓取字幕");
   toast("正在抓取字幕…");
   const cap = await requestCaptions();
@@ -630,6 +982,8 @@ async function start() {
   if (cap.error || !cap.segments) {
     toast(cap.error || "无法获取字幕。", 6000);
     state.active = false;
+    notifyState(false);
+    hideStatus();
     return;
   }
   state.videoId = cap.videoId || getVideoIdFromPage() || "";
@@ -646,6 +1000,22 @@ async function start() {
   state.phrases = buildPhrases(cap.segments);
   state.lastPhraseIndex = -1;
   state.renderKey = "";
+
+  // 加载缓存：后端（跨会话）+ 浏览器本地，合并后裁剪到当前句子表。
+  const [backendCache, localCache] = await Promise.all([
+    loadBackendCache(state.videoId),
+    loadCache(state.videoId),
+  ]);
+  state.cache = { ...backendCache, ...localCache };
+  state.backendCacheSnapshot = backendCache;
+  pruneCacheToPhrases();
+  await pruneInvalidTranslations();
+  sanitizeLoadedTranslations();
+  console.log(
+    LOG,
+    `缓存加载: 后端 ${Object.keys(backendCache).length}，本地 ${Object.keys(localCache).length}，videoId=${state.videoId}`
+  );
+
   console.log(
     LOG,
     `碎片 ${cap.segments.length} → 句子 ${state.phrases.length}，首句:`,
@@ -655,6 +1025,7 @@ async function start() {
   if (state.syncTimer) clearInterval(state.syncTimer);
   state.syncTimer = setInterval(syncTick, 200);
   syncTick();
+  renderStatus();
 
   const video = getVideo();
   console.log(
@@ -666,18 +1037,6 @@ async function start() {
   );
   toast(
     `已获取 ${cap.segments.length} 条字幕${via}${asr}，合并为 ${state.phrases.length} 句，开始翻译…`
-  );
-
-  // 加载缓存：后端（跨会话）+ 浏览器本地，合并后优先已有译文。
-  const [backendCache, localCache] = await Promise.all([
-    loadBackendCache(state.videoId),
-    loadCache(state.videoId),
-  ]);
-  state.cache = { ...backendCache, ...localCache };
-  state.backendCacheSnapshot = backendCache;
-  console.log(
-    LOG,
-    `缓存加载: 后端 ${Object.keys(backendCache).length}，本地 ${Object.keys(localCache).length}，videoId=${state.videoId}`
   );
 
   state.translateToken += 1;
@@ -715,7 +1074,7 @@ async function start() {
   };
 }
 
-function stop() {
+function stop(silent = false) {
   if (state.syncTimer) clearInterval(state.syncTimer);
   state.syncTimer = null;
   state.segments = [];
@@ -724,33 +1083,51 @@ function stop() {
   state.renderKey = "";
   state.translateToken += 1;
   showSubtitle("", "");
-  toast("中文字幕已关闭");
+  hideStatus();
+  notifyState(false);
+  if (!silent) toast("中文字幕已关闭");
 }
 
 async function toggle() {
   state.active = !state.active;
   if (state.active) {
+    userOff = false;
     await start();
   } else {
+    userOff = true;
     stop();
   }
 }
 
-// 切换视频时自动清理（YouTube 是 SPA）。
+// 切换视频时自动清理（YouTube 是 SPA），新视频默认自动开启。
 let lastUrl = location.href;
 setInterval(() => {
   if (location.href !== lastUrl) {
     lastUrl = location.href;
+    userOff = false;
     if (state.active) {
-      stop();
+      stop(true);
       state.active = false;
     }
+    if (isWatchPage()) autoStart();
   }
 }, 1000);
+
+function isWatchPage() {
+  return location.pathname === "/watch" && getVideoIdFromPage();
+}
+
+// 进入 YouTube 视频页后默认自动开启（用户手动关闭后本视频内不再自动开）。
+async function autoStart() {
+  if (!isWatchPage() || state.active || userOff) return;
+  state.active = true;
+  await start();
+}
 
 chrome.runtime.onMessage.addListener((msg) => {
   console.log(LOG, "收到消息:", msg);
   if (msg && msg.type === "YTT_TOGGLE") toggle();
 });
 
-console.log(LOG, "content-ui 已加载，按 Alt+Shift+Y 或点击扩展图标开启");
+console.log(LOG, "content-ui 已加载，视频页将自动开启中文字幕");
+autoStart();

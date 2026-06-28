@@ -18,6 +18,9 @@ backend/.env
 # 翻译缓存（运行时生成）
 backend/cache/
 
+# 内容小结（运行时生成）
+backend/summaries/
+
 # 编辑器 / 系统
 .DS_Store
 .idea/
